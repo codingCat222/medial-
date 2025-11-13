@@ -1,537 +1,834 @@
-import React, { useState, useEffect, useCallback } from 'react';
-import { initializeApp } from 'firebase/app';
-import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
-import { getFirestore, doc, onSnapshot, collection, query, setDoc, getDocs, updateDoc, arrayUnion, writeBatch } from 'firebase/firestore';
-import { setLogLevel } from 'firebase/firestore';
-import { BookOpen, BrainCircuit, GraduationCap, ArrowLeft, CheckCircle } from 'lucide-react';
-
-// --- Configuration Retrieval Safety Check ---
-// The original global variables (__app_id, __firebase_config, etc.) are only defined
-// in the Canvas environment. When deploying to Vercel, they are undefined,
-// causing the build to fail. We provide safer defaults and expect the user
-// to set their own Vercel environment variables if deploying externally.
-
-const SAFELY_GET_GLOBAL = (name, defaultValue) => {
-    // Check if running in a client-side environment where globals might exist
-    if (typeof window !== 'undefined' && typeof window[name] !== 'undefined') {
-        return window[name];
-    }
-    // For Vercel/Node environment, return a safe default
-    return defaultValue;
-};
-
-const appId = SAFELY_GET_GLOBAL('__app_id', 'vercel-medical-app');
-// Get config as a string and parse it, or use an empty object if unavailable
-const firebaseConfigString = SAFELY_GET_GLOBAL('__firebase_config', '{}');
-const firebaseConfig = JSON.parse(firebaseConfigString);
-const initialAuthToken = SAFELY_GET_GLOBAL('__initial_auth_token', null);
-
-// Helper to create the public path for courses
-const getCourseCollectionPath = (appId) => `/artifacts/${appId}/public/data/medicalCourses`;
-// Helper to create the private path for user progress
-const getUserProgressDocPath = (appId, userId) => `/artifacts/${appId}/users/${userId}/progress/user_data`;
-
-// --- Mock Data Structure for Seeding ---
-const initialMedicalCourses = [
-  { id: 'mca201', code: 'MCA 201', title: 'Human Anatomy I', level: 200, topics: [
-    { id: 't1', title: 'Skeletal System Overview', description: 'Study of bone structure and classification.' },
-    { id: 't2', title: 'Muscular System Structure', description: 'Detailed look at muscle fiber types and attachments.' },
-    { id: 't3', title: 'Nervous System Basics', description: 'Introduction to neurons, glial cells, and spinal cord segments.' },
-  ]},
-  { id: 'mcg202', code: 'MCG 202', title: 'Physiology Fundamentals', level: 200, topics: [
-    { id: 't4', title: 'Cellular Respiration', description: 'Glycolysis, Krebs cycle, and ATP production.' },
-    { id: 't5', title: 'Blood Composition', description: 'Erythrocytes, leukocytes, and plasma proteins.' },
-    { id: 't6', title: 'Hormonal Regulation', description: 'Endocrine system feedback loops and common hormones.' },
-  ]},
-  { id: 'mcp301', code: 'MCP 301', title: 'Pharmacology I', level: 300, topics: [
-    { id: 't7', title: 'Drug Absorption Kinetics', description: 'First-pass effect and routes of administration.' },
-    { id: 't8', title: 'Receptor Binding', description: 'Agonists, antagonists, and competitive inhibition.' },
-    { id: 't9', title: 'Antibiotic Mechanisms', description: 'Classes of antibiotics and their targets.' },
-  ]},
-  { id: 'mcc302', code: 'MCC 302', title: 'Clinical Chemistry', level: 300, topics: [
-    { id: 't10', title: 'Enzyme Assays', description: 'Measurement principles and clinical significance.' },
-    { id: 't11', title: 'Electrolyte Balance', description: 'Sodium, potassium, and fluid homeostasis.' },
-    { id: 't12', title: 'Acid-Base Homeostasis', description: 'Buffers, compensation mechanisms, and common imbalances.' },
-  ]},
-];
-
-
-// --- Main Application Component ---
-const App = () => {
-  // --- Firebase/Auth State ---
-  const [db, setDb] = useState(null);
-  const [auth, setAuth] = useState(null);
-  const [userId, setUserId] = useState(null);
-  const [isAuthReady, setIsAuthReady] = useState(false);
-  const [error, setError] = useState(null);
-  const [loading, setLoading] = useState(true);
-
-  // --- Application State ---
-  const [currentPage, setCurrentPage] = useState('dashboard');
-  const [courses, setCourses] = useState([]);
-  const [userProgress, setUserProgress] = useState({ readCourses: [], quizzes: [] });
-  const [selectedCourse, setSelectedCourse] = useState(null);
-
-  // 1. Firebase Initialization and Silent Authentication
-  useEffect(() => {
-    // Check if configuration is even remotely viable before attempting Firebase init
-    const isConfigValid = firebaseConfig && firebaseConfig.apiKey && firebaseConfig.projectId;
-
-    try {
-      if (!isConfigValid) {
-        console.warn("Firebase configuration is missing or invalid. Running in mock mode.");
-        // Set mock state to allow UI to render without database functionality
-        setUserId('mock-user-123');
-        setIsAuthReady(true);
-        setLoading(false);
-        setError("Firebase connection failed: Configuration missing. Please set Vercel Environment Variables.");
-        return;
-      }
-
-      setLogLevel('debug');
-      const firebaseApp = initializeApp(firebaseConfig);
-      const firestoreDb = getFirestore(firebaseApp);
-      const firebaseAuth = getAuth(firebaseApp);
-
-      setDb(firestoreDb);
-      setAuth(firebaseAuth);
-
-      const unsubscribe = onAuthStateChanged(firebaseAuth, async (user) => {
-        if (user) {
-          setUserId(user.uid);
-        } else {
-          setUserId(null);
-        }
-        setIsAuthReady(true);
-        setLoading(false);
-      });
-
-      // Initial silent sign-in attempt
-      const signInUserSilently = async () => {
-        try {
-          // Only attempt signInWithCustomToken if token exists
-          if (initialAuthToken) {
-            await signInWithCustomToken(firebaseAuth, initialAuthToken);
-          } else {
-            // Sign in anonymously if no token is provided (standard Vercel behavior)
-            await signInAnonymously(firebaseAuth);
-          }
-        } catch (e) {
-          console.error("Firebase Auth Error:", e);
-          setError("Failed to sign in. Check console for details.");
-          setIsAuthReady(true);
-          setLoading(false);
-        }
-      };
-
-      signInUserSilently();
-      return () => unsubscribe();
-
-    } catch (e) {
-      console.error("Firebase Init Error:", e);
-      setError("Failed to initialize Firebase. (Check API Key/Config)");
-      setLoading(false);
-    }
-  }, []); // firebaseConfig is stable (from global scope)
-
-  // 2. Data Seeding (Run once after auth is ready and DB is available)
-  const seedCourses = useCallback(async () => {
-    if (!db || !isAuthReady) return;
-
-    const courseCollectionRef = collection(db, getCourseCollectionPath(appId));
-    
-    try {
-      const existingDocs = await getDocs(query(courseCollectionRef));
-      if (existingDocs.empty) {
-        console.log("Seeding initial medical courses...");
-        const batch = writeBatch(db);
-        initialMedicalCourses.forEach(course => {
-          const courseDocRef = doc(courseCollectionRef, course.id);
-          batch.set(courseDocRef, course);
-        });
-        await batch.commit();
-        console.log("Seeding complete.");
-      }
-    } catch (e) {
-      console.error("Error checking or seeding courses:", e);
-      // Don't override primary connection error if it exists
-      if (!error) setError("Failed to seed initial course data.");
-    }
-  }, [db, isAuthReady, appId, error]);
-
-  useEffect(() => {
-    seedCourses();
-  }, [seedCourses]);
-
-
-  // 3. Data Fetching (Courses and User Progress)
-  useEffect(() => {
-    if (!db || !isAuthReady || !userId) return;
-
-    // Fetch Courses (Public Data)
-    const courseCollectionRef = collection(db, getCourseCollectionPath(appId));
-    const unsubscribeCourses = onSnapshot(courseCollectionRef, (snapshot) => {
-      const loadedCourses = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-      setCourses(loadedCourses);
-    }, (e) => {
-      console.error("Error fetching courses:", e);
-      // Don't override primary connection error if it exists
-      if (!error) setError("Failed to load courses.");
-    });
-
-    // Fetch User Progress (Private Data)
-    const progressDocRef = doc(db, getUserProgressDocPath(appId, userId));
-    const unsubscribeProgress = onSnapshot(progressDocRef, (docSnapshot) => {
-      if (docSnapshot.exists()) {
-        const data = docSnapshot.data();
-        setUserProgress({
-          readCourses: data.readCourses || [],
-          quizzes: data.quizzes || [],
-        });
-      } else {
-        // Initialize progress document if it doesn't exist
-        setDoc(progressDocRef, { userId, readCourses: [], quizzes: [] }, { merge: true }).catch(e => console.error("Error initializing progress:", e));
-        setUserProgress({ readCourses: [], quizzes: [] });
-      }
-    }, (e) => {
-      console.error("Error fetching user progress:", e);
-      if (!error) setError("Failed to load user progress.");
-    });
-
-    return () => {
-      unsubscribeCourses();
-      unsubscribeProgress();
-    };
-  }, [db, isAuthReady, userId, appId, error]);
-
-
-  // --- Event Handlers ---
-
-  const handleCourseSelect = (course) => {
-    setSelectedCourse(course);
-    setCurrentPage('topics');
-  };
-
-  const handleTopicRead = async (courseId, courseCode, topicTitle) => {
-    if (!db || !userId) {
-      setError("Cannot save progress: Not connected to the database.");
-      return;
-    }
-
-    const progressDocRef = doc(db, getUserProgressDocPath(appId, userId));
-    const readKey = `${courseId}-${topicTitle}`;
-    const quizKey = `${courseCode}-${topicTitle}`;
-
-    try {
-      // 1. Mark topic as read (using arrayUnion to prevent duplicates)
-      await updateDoc(progressDocRef, {
-        readCourses: arrayUnion(readKey)
-      });
-      console.log(`Topic ${topicTitle} marked as read.`);
-
-      // 2. Mock Quiz Attempt (Only if it's not already logged as attempted)
-      const existingQuiz = userProgress.quizzes.find(q => q.key === quizKey);
-      if (!existingQuiz) {
-        await updateDoc(progressDocRef, {
-          quizzes: arrayUnion({ 
-            key: quizKey, 
-            courseCode: courseCode, 
-            topic: topicTitle, 
-            score: Math.floor(Math.random() * 5) + 6, // Mock score 6-10
-            maxScore: 10, 
-            date: new Date().toISOString() 
-          })
-        });
-        console.log(`Mock quiz recorded for ${topicTitle}.`);
-      }
-    } catch (e) {
-      console.error("Error updating progress:", e);
-      setError("Failed to update user progress.");
-    }
-  };
-
-  // --- Utility Components (same as before) ---
-  const LoadingSpinner = () => (
-    <div className="flex flex-col items-center justify-center min-h-screen bg-gray-50">
-      <div className="animate-spin rounded-full h-16 w-16 border-t-4 border-b-4 border-blue-500"></div>
-      <p className="mt-4 text-gray-600 font-medium">Authenticating and loading courses...</p>
-    </div>
-  );
-
-  const Card = ({ children, title, className = '' }) => (
-    <div className={`bg-white p-6 shadow-xl rounded-xl ${className}`}>
-      {title && <h2 className="text-3xl font-bold text-gray-800 mb-6 border-b pb-2">{title}</h2>}
-      {children}
-    </div>
-  );
-
-  const Header = ({ title, showBack, onBack, children }) => (
-    <div className="sticky top-0 bg-white shadow-md p-4 mb-6 z-10">
-      <div className="max-w-6xl mx-auto flex justify-between items-center">
-        <div className="flex items-center">
-          {showBack && (
-            <button onClick={onBack} className="mr-3 p-2 rounded-full text-gray-600 hover:bg-gray-200 transition duration-150">
-              <ArrowLeft className="h-6 w-6" />
-            </button>
-          )}
-          <h1 className="text-3xl font-extrabold text-gray-900 flex items-center space-x-2">
-            <GraduationCap className="w-8 h-8 text-blue-600" />
-            <span>{title}</span>
-          </h1>
-        </div>
-        <div className="flex items-center space-x-3">
-          {children}
-          <div className="text-sm text-gray-500 hidden sm:block">
-            <span className="font-semibold">User ID:</span> 
-            <span className="font-mono text-xs ml-1 bg-gray-100 p-1 rounded">{userId || 'N/A'}</span>
-          </div>
-        </div>
-      </div>
-    </div>
-  );
-  
-  // DashboardView, CourseListView, CourseCard, TopicsView are unchanged from the previous, working version (omitted for brevity)
-  
-  const DashboardView = () => {
-    const attemptedQuizzes = userProgress.quizzes.length;
-    const uniqueReadCourses = new Set(userProgress.readCourses.map(key => key.split('-')[0])).size;
-
-    return (
-      <div className="p-4 sm:p-6 bg-gray-50 min-h-screen">
-        <Header title="Dashboard" showBack={false}>
-          <button
-            onClick={() => setCurrentPage('courses')}
-            className="bg-blue-600 hover:bg-blue-700 text-white font-semibold py-2 px-4 rounded-lg transition duration-150 shadow-md flex items-center space-x-2"
-          >
-            <BookOpen className="w-5 h-5" />
-            <span>Browse Courses</span>
-          </button>
-        </Header>
-
-        <div className="max-w-6xl mx-auto">
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-6 mb-8">
-            <Card title="Progress Summary" className="bg-gradient-to-r from-blue-50 to-blue-100">
-              <div className="flex justify-around items-center text-gray-800">
-                <div className="text-center p-3">
-                  <p className="text-6xl font-extrabold text-blue-600">{uniqueReadCourses}</p>
-                  <p className="text-lg font-medium mt-1">Courses Started</p>
-                </div>
-                <div className="text-center p-3">
-                  <p className="text-6xl font-extrabold text-indigo-600">{attemptedQuizzes}</p>
-                  <p className="text-lg font-medium mt-1">Quizzes Attempted</p>
-                </div>
-              </div>
-            </Card>
-
-            <Card title="Recent Quiz Attempts" className="h-full">
-              {userProgress.quizzes.slice(-5).reverse().length > 0 ? (
-                <ul className="space-y-3">
-                  {userProgress.quizzes.slice(-5).reverse().map((quiz, index) => (
-                    <li key={index} className="flex flex-col sm:flex-row justify-between items-start sm:items-center p-3 bg-gray-50 rounded-lg border-l-4 border-indigo-400">
-                      <div className="text-sm font-medium text-gray-700">
-                        <span className="font-bold mr-1">{quiz.courseCode}:</span> {quiz.topic}
-                      </div>
-                      <span className={`text-xs font-bold px-2 py-1 rounded-full mt-1 sm:mt-0 ${quiz.score >= 7 ? 'bg-green-100 text-green-700' : 'bg-yellow-100 text-yellow-700'}`}>
-                        Score: {quiz.score}/{quiz.maxScore}
-                      </span>
-                    </li>
-                  ))}
-                </ul>
-              ) : (
-                <p className="text-gray-500 italic">No activity recorded. Start a course to track your progress!</p>
-              )}
-            </Card>
-          </div>
-          
-          <CourseListView compact={true} />
-        </div>
-      </div>
-    );
-  };
-
-  const CourseListView = ({ compact = false }) => {
-    const courses200L = courses.filter(c => c.level === 200).sort((a, b) => a.code.localeCompare(b.code));
-    const courses300L = courses.filter(c => c.level === 300).sort((a, b) => a.code.localeCompare(b.code));
-
-    const courseListContent = (
-      <>
-        <h3 className="text-2xl font-semibold text-gray-700 mb-4 border-b border-gray-200 pb-2">200 Level Courses</h3>
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4 mb-8">
-          {courses200L.map(course => (
-            <CourseCard key={course.id} course={course} onSelect={handleCourseSelect} userProgress={userProgress} />
-          ))}
-        </div>
-
-        <h3 className="text-2xl font-semibold text-gray-700 mb-4 border-b border-gray-200 pb-2">300 Level Courses</h3>
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-          {courses300L.map(course => (
-            <CourseCard key={course.id} course={course} onSelect={handleCourseSelect} userProgress={userProgress} />
-          ))}
-        </div>
-      </>
-    );
-
-    if (compact) {
-      return (
-        <Card title="All Medical Courses" className="mt-6">
-          {courseListContent}
-        </Card>
-      );
-    }
-
-    // Full Course List View
-    return (
-      <div className="p-4 sm:p-6 bg-gray-50 min-h-screen">
-        <Header title="All Medical Courses" showBack={true} onBack={() => setCurrentPage('dashboard')} />
-        <div className="max-w-6xl mx-auto">
-          <Card title="Course Catalog">
-            {courseListContent}
-          </Card>
-        </div>
-      </div>
-    );
-  };
-
-  const CourseCard = ({ course, onSelect, userProgress }) => {
-    const totalTopics = course.topics.length;
-    const readCount = course.topics.filter(topic =>
-      userProgress.readCourses.includes(`${course.id}-${topic.title}`)
-    ).length;
-    const progress = totalTopics > 0 ? Math.round((readCount / totalTopics) * 100) : 0;
-
-    return (
-      <div
-        className="bg-white border border-gray-200 p-5 rounded-xl shadow-lg hover:shadow-xl transition duration-300 cursor-pointer flex flex-col justify-between"
-        onClick={() => onSelect(course)}
-      >
-        <div>
-          <span className="text-sm font-bold text-blue-600 bg-blue-100 px-3 py-1 rounded-full">{course.code}</span>
-          <h4 className="text-xl font-bold mt-2 text-gray-800 line-clamp-2">{course.title}</h4>
-        </div>
-        <div className="mt-4">
-          <div className="flex justify-between text-sm text-gray-600 mb-1">
-            <span>Progress</span>
-            <span className="font-semibold text-blue-600">{progress}%</span>
-          </div>
-          <div className="w-full bg-gray-200 rounded-full h-2.5">
-            <div
-              className="bg-blue-600 h-2.5 rounded-full transition-all duration-500"
-              style={{ width: `${progress}%` }}
-            ></div>
-          </div>
-          <p className="text-xs text-gray-500 mt-1">{readCount} of {totalTopics} topics read</p>
-        </div>
-      </div>
-    );
-  };
-
-  const TopicsView = () => {
-    if (!selectedCourse) return <p className="p-6">Course not selected.</p>;
-
-    return (
-      <div className="p-4 sm:p-6 bg-gray-50 min-h-screen">
-        <Header 
-          title={`${selectedCourse.code}: ${selectedCourse.title}`} 
-          showBack={true} 
-          onBack={() => setCurrentPage('courses')} 
-        />
-
-        <Card title="Core Topics" className="max-w-4xl mx-auto mt-6">
-          <p className="text-gray-600 mb-6 italic">
-            Click on a topic to mark it as read. This also simulates a **quiz attempt** for your dashboard.
-          </p>
-          <ul className="space-y-4">
-            {selectedCourse.topics.map((topic, index) => {
-              const isRead = userProgress.readCourses.includes(`${selectedCourse.id}-${topic.title}`);
-              const hasAttemptedQuiz = userProgress.quizzes.some(q => q.key === `${selectedCourse.code}-${topic.title}`);
-
-              return (
-                <li
-                  key={index}
-                  className={`p-4 rounded-xl border-l-8 cursor-pointer transition duration-200 shadow-md ${
-                    isRead ? 'bg-green-50 border-green-500 hover:bg-green-100' : 'bg-white border-blue-400 hover:bg-blue-50'
-                  }`}
-                  onClick={() => handleTopicRead(selectedCourse.id, selectedCourse.code, topic.title)}
-                >
-                  <div className="flex justify-between items-center">
-                    <h5 className="text-lg font-bold text-gray-800 flex items-center space-x-2">
-                      <BookOpen className="w-5 h-5 text-gray-600" />
-                      <span>{topic.title}</span>
-                    </h5>
-                    <div className="flex items-center space-x-3 text-sm font-medium">
-                      {hasAttemptedQuiz && (
-                        <span className="bg-indigo-100 text-indigo-700 px-3 py-1 rounded-full flex items-center">
-                          <BrainCircuit className="w-4 h-4 mr-1" />
-                          Quiz Done
-                        </span>
-                      )}
-                      {isRead ? (
-                        <span className="text-green-700 flex items-center">
-                          <CheckCircle className="h-5 w-5 mr-1" />
-                          Read
-                        </span>
-                      ) : (
-                        <span className="text-gray-500">Mark as Read</span>
-                      )}
-                    </div>
-                  </div>
-                  <p className="text-sm text-gray-600 mt-2">{topic.description}</p>
-                </li>
-              );
-            })}
-          </ul>
-        </Card>
-      </div>
-    );
-  };
-
-
-  // --- Main Render Logic ---
-  if (loading || !isAuthReady) {
-    return <LoadingSpinner />;
-  }
-
-  // Display a prominent error if Firebase configuration is missing (Vercel deployment)
-  if (error && error.includes('Configuration missing')) {
-    return (
-      <div className="p-6 bg-red-100 text-red-700 min-h-screen">
-        <h1 className="text-3xl font-bold mb-4">Deployment Error: Firebase Configuration Required</h1>
-        <p className="mb-4">This application needs Firebase credentials to connect to the database and track user progress. The provided global variables were not found in the Vercel environment.</p>
-        <p className="font-semibold">To fix this, you must set the following values as **Environment Variables** in your Vercel project settings:</p>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PhysioStudy Hub: Core Topics and Immediate Feedback Quiz</title>
+    <!-- Load Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Load Lucide Icons -->
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <style>
+        /* Custom font import */
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@100..900&display=swap');
         
-        <div className="mt-4 p-4 bg-red-50 rounded-lg border border-red-300 font-mono text-sm">
-          <p className="mb-2"><span className="font-bold text-red-800">1. APP_ID</span>: A unique ID for your app (e.g., `e-learning-v1`). This replaces `__app_id`.</p>
-          <p><span className="font-bold text-red-800">2. FIREBASE_CONFIG</span>: Your entire Firebase JSON config object as a **single, escaped string**.</p>
-          <p className="mt-3 text-xs italic">Example (make sure to replace the values with your own):</p>
-          <pre className="whitespace-pre-wrap p-2 bg-gray-100 rounded mt-1">
-            &#123;"apiKey":"AIzaSy...","authDomain":"your-project.firebaseapp.com","projectId":"your-project-id", ... &#125;
-          </pre>
+        :root {
+            --primary: #059669; /* Emerald 600 */
+            --secondary: #2563eb; /* Blue 600 */
+            --bg-light: #f9fafb;
+        }
+
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: var(--bg-light);
+        }
+
+        .card {
+            box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05);
+        }
+        
+        .loading-ring {
+            display: inline-block;
+            width: 50px;
+            height: 50px;
+            border: 5px solid #d1d5db; /* Gray 300 */
+            border-radius: 50%;
+            border-top-color: var(--primary);
+            animation: spin 1s ease-in-out infinite;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+        
+        /* Ensures the icon rendering works within the shadow DOM if used */
+        [data-lucide] {
+            display: inline-block;
+        }
+        
+        /* Markdown rendering cleanup for explanation text */
+        .prose > p:first-child { margin-top: 0; }
+        .prose > p:last-child { margin-bottom: 0; }
+
+        /* Timer display style */
+        .timer-display {
+            font-variant-numeric: tabular-nums;
+        }
+    </style>
+</head>
+<body class="min-h-screen flex items-start pt-12 justify-center p-4">
+
+    <div id="app" class="w-full max-w-3xl bg-white rounded-xl card p-6 md:p-10 mb-12">
+        
+        <!-- Header -->
+        <header class="mb-8 text-center border-b pb-4 border-gray-100">
+            <div class="flex items-center justify-center space-x-3 text-gray-700 mb-2">
+                <i data-lucide="stethoscope" class="w-8 h-8 text-green-600"></i>
+                <h1 class="text-3xl font-extrabold text-gray-800">PhysioStudy Hub</h1>
+            </div>
+            <p class="text-gray-500 text-base">Select a Course, then choose a Core Topic to master.</p>
+        </header>
+
+        <!-- Quiz Status Bar (Timer & Progress) -->
+        <div id="quiz-status" class="hidden mb-6 bg-white p-4 rounded-xl border border-gray-200 shadow-sm">
+            <div class="flex justify-between items-center text-gray-600 font-medium">
+                <div class="flex items-center space-x-2">
+                    <i data-lucide="clock" class="w-5 h-5 text-red-500"></i>
+                    <span id="timer" class="text-lg font-bold text-red-600 timer-display">15:00</span>
+                </div>
+                <div class="flex items-center space-x-2">
+                    <i data-lucide="bar-chart-2" class="w-5 h-5 text-emerald-500"></i>
+                    <span id="progress-text">Q 1/30</span>
+                </div>
+            </div>
         </div>
-        <p className="mt-4">Since Vercel doesn't use the custom auth token, the app will sign users in anonymously, which is safe for tracking private data.</p>
-      </div>
-    );
-  }
 
-  // Handle other runtime errors
-  if (error) {
-    return (
-      <div className="p-6 bg-red-100 text-red-700 min-h-screen">
-        <p className="text-lg font-bold mb-4">Runtime Error</p>
-        <p>{error}</p>
-      </div>
-    );
-  }
+        <!-- Dynamic Content Area -->
+        <div id="content-area">
+            <!-- Content will be rendered here by JavaScript -->
+        </div>
+        
+        <!-- Action bar for returning to selection (visible in quiz/explanation mode) -->
+        <div id="action-bar" class="mt-8 pt-4 border-t border-gray-100 hidden">
+            <button id="back-button" class="py-2 px-4 bg-gray-100 hover:bg-gray-200 text-gray-700 font-medium rounded-lg transition duration-200 flex items-center space-x-2">
+                <i data-lucide="arrow-left" class="w-4 h-4"></i>
+                <span id="back-text">Back to Courses</span>
+            </button>
+        </div>
 
-  // Render the current page view
-  switch (currentPage) {
-    case 'courses':
-      return <CourseListView compact={false} />;
-    case 'topics':
-      return <TopicsView />;
-    case 'dashboard':
-    default:
-      return <DashboardView />;
-  }
-};
+    </div>
+    
+    <!-- Template for a single quiz question -->
+    <template id="quiz-template">
+        <div class="space-y-6">
+            <!-- Question Box -->
+            <div class="bg-gray-100 p-4 rounded-xl shadow-inner border-l-4 border-emerald-500">
+                <p class="text-lg font-medium text-gray-700" id="q-text"></p>
+            </div>
+            
+            <!-- Options -->
+            <div id="q-options" class="space-y-3">
+                <!-- Options will be injected here -->
+            </div>
+            
+            <!-- Immediate Feedback/Explanation Area (Initially Hidden) -->
+            <div id="q-feedback" class="hidden mt-6 pt-4 border-t border-gray-200">
+                <h3 class="text-xl font-bold text-gray-800 mb-3 flex items-center space-x-2">
+                    <i data-lucide="lightbulb" class="w-6 h-6 text-yellow-500"></i>
+                    <span>Detailed Explanation</span>
+                </h3>
+                <div id="explanation-content" class="bg-white p-4 rounded-lg border border-gray-100 shadow-inner">
+                    <!-- Explanation text or loading spinner will go here -->
+                </div>
+            </div>
 
-export default App;
+            <!-- Submit Button -->
+            <div class="pt-4">
+                <button id="q-submit" class="w-full py-3 px-6 bg-emerald-500 hover:bg-emerald-600 text-white font-bold rounded-xl transition duration-200 disabled:opacity-50 flex items-center justify-center space-x-2 shadow-md">
+                    <span id="submit-text">Submit Answer</span>
+                    <i data-lucide="check-circle" class="w-5 h-5"></i>
+                </button>
+            </div>
+        </div>
+    </template>
+    
+    <!-- Template for displaying results -->
+    <template id="results-template">
+        <div class="text-center space-y-6">
+            <i data-lucide="trophy" class="w-16 h-16 mx-auto text-yellow-500"></i>
+            <h2 class="text-3xl font-bold text-gray-800">Quiz Complete!</h2>
+            <p class="text-xl text-gray-600">You scored <span id="final-score" class="font-extrabold text-emerald-600"></span> out of <span id="total-questions" class="font-bold"></span>.</p>
+            
+            <div id="feedback-message" class="text-lg font-medium p-4 rounded-xl"></div>
+
+            <button id="review-button" class="mt-4 w-full py-3 px-6 bg-blue-500 hover:bg-blue-600 text-white font-bold rounded-xl transition duration-200 flex items-center justify-center space-x-2 shadow-md">
+                <i data-lucide="rotate-ccw" class="w-5 h-5"></i>
+                <span>Review Topic Summary</span>
+            </button>
+        </div>
+    </template>
+
+    <script>
+        // --- GLOBAL CONFIGURATION AND SETUP ---
+        const API_KEY = ""; 
+        const TEXT_MODEL = "gemini-2.5-flash-preview-09-2025";
+        const IMAGE_MODEL = "imagen-4.0-generate-001";
+        const TEXT_API_URL = `https://generativelanguage.googleapis.com/v1beta/models/${TEXT_MODEL}:generateContent?key=${API_KEY}`;
+        const IMAGE_API_URL = `https://generativelanguage.googleapis.com/v1beta/models/${IMAGE_MODEL}:predict?key=${API_KEY}`;
+        
+        // --- QUIZ & TIME CONSTANTS ---
+        const QUIZ_LENGTH = 30; // 30 questions per quiz
+        const TIME_LIMIT_SECONDS = 900; // 15 minutes * 60 seconds
+
+        // Refactored structure: Courses contain subTopics
+        const TOPICS = [
+            { 
+                name: "Anatomy & Kinesiology", 
+                icon: "bone",
+                subTopics: [
+                    { 
+                        name: "Joint Biomechanics",
+                        explPrompt: "Provide a detailed, structured summary of joint biomechanics, covering synovial joint classification, degrees of freedom, and the relationship between joint geometry and movement (e.g., convex-concave rule).",
+                        imgPrompt: "Detailed medical illustration of the human glenohumeral (shoulder) joint demonstrating the convex-concave rule in motion, professional scientific style."
+                    },
+                    { 
+                        name: "Gait Analysis Principles", 
+                        explPrompt: "Provide a detailed, structured summary of the phases of the gait cycle (stance and swing), key muscle activity during each phase, and common pathological deviations (e.g., Trendelenburg gait).",
+                        imgPrompt: "Infographic illustrating the eight phases of the human gait cycle, showing ground reaction forces and associated joint angles."
+                    },
+                    { 
+                        name: "Muscle Fiber Types", 
+                        explPrompt: "Provide a detailed, structured summary differentiating between Type I (slow-twitch) and Type II (fast-twitch) muscle fibers, including their metabolic characteristics, fatigue resistance, and clinical relevance to endurance and power training.",
+                        imgPrompt: "Microscopic diagram comparing the structural and metabolic differences between Type I and Type II skeletal muscle fibers."
+                    },
+                ]
+            },
+            { 
+                name: "Physiology & Pathophysiology", 
+                icon: "heart-handshake",
+                subTopics: [
+                    { 
+                        name: "Cardiac Output Regulation", 
+                        explPrompt: "Provide a detailed, structured summary of the factors that regulate Cardiac Output (CO), including the Frank-Starling mechanism, preload, afterload, and heart rate control.",
+                        imgPrompt: "Diagram illustrating the major factors influencing Cardiac Output (CO = HR x SV), including venous return and sympathetic/parasympathetic nervous system control, suitable for a medical textbook."
+                    },
+                    { 
+                        name: "Respiratory Gas Exchange", 
+                        explPrompt: "Provide a detailed, structured summary of alveolar-capillary gas exchange, including partial pressure gradients, Fick's law of diffusion, and the oxygen-hemoglobin dissociation curve.",
+                        imgPrompt: "Scientific diagram of the alveolar-capillary membrane, showing the diffusion of oxygen and carbon dioxide based on partial pressure gradients."
+                    },
+                    { 
+                        name: "Reflex Arc and Motor Control", 
+                        explPrompt: "Provide a detailed, structured summary of the basic components of the reflex arc (afferent, efferent, interneuron), and differentiate between stretch reflexes and Golgi tendon organ function.",
+                        imgPrompt: "Clear diagram of the monosynaptic stretch reflex arc, showing the muscle spindle, sensory neuron, and alpha motor neuron."
+                    },
+                ]
+            },
+            { 
+                name: "Biochemistry", 
+                icon: "flask-conical",
+                subTopics: [
+                    { 
+                        name: "Glycolysis Pathway", 
+                        explPrompt: "Provide a detailed, structured summary of the Glycolysis metabolic pathway, including the key regulated steps, substrates, products (ATP, NADH), and its clinical importance in exercise and hypoxia.",
+                        imgPrompt: "Detailed diagram illustrating the 10 steps of the Glycolysis pathway, highlighting the key enzymes and ATP consumption/production steps, professional biochemical style."
+                    },
+                    { 
+                        name: "Enzyme Kinetics (Michaelis-Menten)", 
+                        explPrompt: "Provide a detailed, structured summary of enzyme kinetics, explaining $V_{\text{max}}$, $K_{\text{m}}$, and the Michaelis-Menten equation, and the concepts of competitive and non-competitive inhibition.",
+                        imgPrompt: "Graph showing the reaction velocity vs. substrate concentration for Michaelis-Menten kinetics, with $K_{\text{m}}$ and $V_{\text{max}}$ labeled."
+                    },
+                    { 
+                        name: "Protein Structure & Function", 
+                        explPrompt: "Provide a detailed, structured summary explaining the four levels of protein structure (primary, secondary, tertiary, quaternary) and how denaturation affects protein function, using collagen or hemoglobin as examples.",
+                        imgPrompt: "Visual representation of the four hierarchical levels of protein structure, using stylized ribbons and coils."
+                    },
+                ]
+            },
+            { 
+                name: "Pharmacology & Therapeutics", 
+                icon: "syringe",
+                subTopics: [
+                    { 
+                        name: "NSAID Mechanisms", 
+                        explPrompt: "Provide a detailed, structured summary of the mechanism of action for Non-Steroidal Anti-Inflammatory Drugs (NSAIDs), differentiating between COX-1 and COX-2 inhibition and associated side effects.",
+                        imgPrompt: "Infographic showing the Arachidonic Acid Cascade and how COX-1 and COX-2 enzymes are blocked by NSAIDs, resulting in decreased prostaglandin synthesis."
+                    },
+                    { 
+                        name: "Opioid Classes & Effects", 
+                        explPrompt: "Provide a detailed, structured summary of the main classes of opioid receptors ($\mu, \kappa, \delta$), the clinical effects of opioid analgesics, and the mechanism of action for opioid antagonists like Naloxone.",
+                        imgPrompt: "Diagram of a synapse showing opioid receptors and the mechanism by which opioids modulate pain signals, including pre- and post-synaptic effects."
+                    },
+                    { 
+                        name: "Corticosteroid Uses in Rehab", 
+                        explPrompt: "Provide a detailed, structured summary of the anti-inflammatory and immunosuppressive effects of corticosteroids, common routes of administration in rehabilitation (e.g., injections), and potential side effects relevant to physical therapy.",
+                        imgPrompt: "Diagram showing the cellular mechanism of action of corticosteroids, illustrating how they inhibit inflammatory gene expression."
+                    },
+                ]
+            },
+            { 
+                name: "Neuroscience", 
+                icon: "brain",
+                subTopics: [
+                    { 
+                        name: "Spinal Cord Tracts", 
+                        explPrompt: "Provide a detailed, structured summary of the major ascending (sensory) and descending (motor) spinal cord tracts, including their location, function, and clinical signs associated with lesions (e.g., Brown-Séquard syndrome).",
+                        imgPrompt: "Cross-section of the spinal cord showing the location and paths of the corticospinal and spinothalamic tracts."
+                    },
+                    { 
+                        name: "Neuroplasticity Concepts", 
+                        explPrompt: "Provide a detailed, structured summary of neuroplasticity, defining concepts like use-dependent plasticity, long-term potentiation (LTP), and the clinical principles guiding neurorehabilitation after injury.",
+                        imgPrompt: "Stylized illustration of a neuron showing synaptic strengthening (LTP) and structural changes associated with neuroplasticity."
+                    },
+                    { 
+                        name: "Motor Unit Recruitment", 
+                        explPrompt: "Provide a detailed, structured summary of the motor unit, defining its components, and explaining the size principle of motor unit recruitment (Henneman's Principle) during increasing force generation.",
+                        imgPrompt: "Diagram illustrating Henneman's Size Principle, showing the sequential recruitment of small (Type I) and large (Type II) motor units as muscle force increases."
+                    }
+                ]
+            },
+        ];
+        
+        // Quiz State
+        let currentCourse = null; 
+        let currentTopic = null; 
+        let quizData = [];
+        let currentQuestionIndex = 0;
+        let score = 0;
+        let selectedAnswer = null;
+        let isAnswered = false;
+        let currentView = 'courses'; 
+        let timerSeconds = TIME_LIMIT_SECONDS;
+        let timerInterval = null;
+
+        const contentArea = document.getElementById('content-area');
+        const actionBar = document.getElementById('action-bar');
+        const backButton = document.getElementById('back-button');
+        const backText = document.getElementById('back-text');
+        const quizStatus = document.getElementById('quiz-status');
+        const timerDisplay = document.getElementById('timer');
+        const progressText = document.getElementById('progress-text');
+        
+        backButton.addEventListener('click', handleBackNavigation);
+
+        // --- TIMER LOGIC ---
+
+        function formatTime(totalSeconds) {
+            const minutes = Math.floor(totalSeconds / 60);
+            const seconds = totalSeconds % 60;
+            return `${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
+        }
+
+        function startTimer() {
+            if (timerInterval) clearInterval(timerInterval);
+            timerSeconds = TIME_LIMIT_SECONDS;
+            timerDisplay.textContent = formatTime(timerSeconds);
+
+            timerInterval = setInterval(() => {
+                if (timerSeconds > 0) {
+                    timerSeconds--;
+                    timerDisplay.textContent = formatTime(timerSeconds);
+                } else {
+                    clearInterval(timerInterval);
+                    renderResults(true); // true indicates time's up
+                }
+            }, 1000);
+        }
+
+        function stopTimer() {
+            if (timerInterval) clearInterval(timerInterval);
+            timerInterval = null;
+        }
+
+
+        // --- UTILITY FUNCTIONS ---
+
+        function showLoading(title, message) {
+            currentView = 'loading';
+            actionBar.classList.add('hidden');
+            quizStatus.classList.add('hidden');
+            contentArea.innerHTML = `
+                <div class="text-center p-8 space-y-4">
+                    <div class="loading-ring mx-auto"></div>
+                    <h2 class="text-2xl font-bold text-gray-800">${title}</h2>
+                    <p class="text-gray-600">${message}</p>
+                </div>
+            `;
+        }
+        
+        function showMessage(icon, title, message) {
+            currentView = 'error';
+            actionBar.classList.add('hidden');
+            quizStatus.classList.add('hidden');
+            contentArea.innerHTML = `
+                <div class="text-center p-6 space-y-4">
+                    <i data-lucide="${icon}" class="w-12 h-12 mx-auto text-red-500"></i>
+                    <h2 class="text-2xl font-bold text-gray-800">${title}</h2>
+                    <p class="text-gray-600">${message}</p>
+                </div>
+            `;
+            lucide.createIcons();
+            // Automatically return to topic selection after an error
+            setTimeout(() => renderSubTopicSelection(currentCourse), 5000); 
+        }
+
+        async function fetchWithBackoff(url, options, maxRetries = 5) {
+            for (let i = 0; i < maxRetries; i++) {
+                try {
+                    const response = await fetch(url, options);
+                    if (response.ok) {
+                        return await response.json();
+                    }
+                    if (response.status === 429 && i < maxRetries - 1) { 
+                        const delay = Math.pow(2, i) * 1000 + Math.random() * 1000;
+                        await new Promise(resolve => setTimeout(resolve, delay));
+                        continue;
+                    }
+                    throw new Error(`API request failed with status: ${response.status} ${response.statusText}`);
+                } catch (error) {
+                    if (i === maxRetries - 1) {
+                        throw new Error(`Failed to fetch content after ${maxRetries} attempts: ${error.message}`);
+                    }
+                    const delay = Math.pow(2, i) * 1000 + Math.random() * 1000;
+                    await new Promise(resolve => setTimeout(resolve, delay));
+                }
+            }
+        }
+        
+        function formatMarkdown(markdown) {
+            let html = markdown;
+            // Headings
+            html = html.replace(/^### (.*$)/gim, '<h3>$1</h3>');
+            html = html.replace(/^## (.*$)/gim, '<h2>$1</h2>');
+            html = html.replace(/^# (.*$)/gim, '<h1>$1</h1>');
+            // Bold
+            html = html.replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>');
+            html = html.replace(/__(.*?)__/g, '<strong>$1</strong>');
+            // Lists (simple conversion for display)
+            html = html.replace(/^\* (.*$)/gim, '<li>$1</li>');
+            html = html.replace(/^(<li>.*<\/li>)/gims, '<ul>$1</ul>');
+            // Paragraphs (ensure line breaks are respected)
+            html = html.replace(/\n\n/g, '</p><p>');
+            html = `<p>${html}</p>`;
+            // Clean up list artifacts
+            html = html.replace(/<\/p><ul>/g, '<ul>').replace(/<\/ul><p>/g, '</ul>');
+            return html;
+        }
+
+
+        // --- NAVIGATION HANDLERS ---
+        
+        function handleBackNavigation() {
+            stopTimer(); // Always stop timer if navigating back
+
+            if (currentView === 'topics') {
+                renderTopicSelection();
+            } else if (currentView === 'quiz' || currentView === 'explanation' || currentView === 'results') {
+                renderSubTopicSelection(currentCourse);
+            }
+        }
+        
+        function renderTopicSelection() {
+            currentView = 'courses';
+            actionBar.classList.add('hidden');
+            quizStatus.classList.add('hidden');
+            contentArea.innerHTML = `
+                <h2 class="text-xl font-semibold text-gray-800 mb-6 text-center">Select a Major Course</h2>
+                <div class="space-y-4" id="course-list">
+                    <!-- Courses will be injected here -->
+                </div>
+            `;
+            
+            const courseList = document.getElementById('course-list');
+            TOPICS.forEach(course => {
+                const courseButton = document.createElement('button');
+                courseButton.className = 'course-select w-full p-5 border border-gray-200 rounded-xl shadow-md space-y-1 text-left transition duration-150 hover:bg-gray-50 flex items-center justify-between';
+                courseButton.innerHTML = `
+                    <div class="flex items-center space-x-4">
+                        <i data-lucide="${course.icon}" class="w-6 h-6 text-blue-500"></i>
+                        <span class="text-xl font-bold text-gray-700">${course.name}</span>
+                    </div>
+                    <i data-lucide="chevron-right" class="w-5 h-5 text-gray-400"></i>
+                `;
+                courseButton.onclick = () => {
+                    currentCourse = course;
+                    renderSubTopicSelection(course);
+                };
+                courseList.appendChild(courseButton);
+            });
+            lucide.createIcons();
+        }
+
+        function renderSubTopicSelection(course) {
+            currentView = 'topics';
+            backText.textContent = 'Back to Courses';
+            actionBar.classList.remove('hidden');
+            quizStatus.classList.add('hidden');
+
+            contentArea.innerHTML = `
+                <h2 class="text-2xl font-bold text-gray-800 mb-6 border-b pb-2">Core Topics in ${course.name}</h2>
+                <p class="text-gray-500 mb-6">Select a specific topic to study or quiz.</p>
+                <div class="space-y-4" id="topic-list">
+                    <!-- Sub-topics will be injected here -->
+                </div>
+            `;
+            
+            const topicList = document.getElementById('topic-list');
+            course.subTopics.forEach(topic => {
+                const topicCard = document.createElement('div');
+                topicCard.className = 'p-5 border border-gray-200 rounded-xl shadow-sm space-y-3';
+                topicCard.innerHTML = `
+                    <h3 class="text-lg font-semibold text-gray-700">${topic.name}</h3>
+                    <div class="flex flex-col sm:flex-row space-y-2 sm:space-y-0 sm:space-x-4 pt-3">
+                        <button data-topic-name="${topic.name}" data-mode="explanation" class="topic-action w-full py-2 px-4 bg-blue-500 hover:bg-blue-600 text-white font-medium rounded-lg transition duration-150 flex items-center justify-center space-x-2 text-sm shadow-md">
+                            <i data-lucide="book-open" class="w-4 h-4"></i>
+                            <span>Summary & Diagram</span>
+                        </button>
+                        <button data-topic-name="${topic.name}" data-mode="quiz" class="topic-action w-full py-2 px-4 bg-emerald-500 hover:bg-emerald-600 text-white font-medium rounded-lg transition duration-150 flex items-center justify-center space-x-2 text-sm shadow-md">
+                            <i data-lucide="brain-circuit" class="w-4 h-4"></i>
+                            <span>Start Quiz (${QUIZ_LENGTH} Qs)</span>
+                        </button>
+                    </div>
+                `;
+                topicList.appendChild(topicCard);
+            });
+            lucide.createIcons();
+            
+            document.querySelectorAll('.topic-action').forEach(button => {
+                button.addEventListener('click', (e) => {
+                    const topicName = e.currentTarget.dataset.topicName;
+                    const mode = e.currentTarget.dataset.mode;
+                    currentTopic = currentCourse.subTopics.find(t => t.name === topicName);
+                    
+                    if (mode === 'explanation') {
+                        getExplanation();
+                    } else if (mode === 'quiz') {
+                        startQuiz();
+                    }
+                });
+            });
+        }
+
+
+        // --- EXPLANATION & IMAGE GENERATION LOGIC (For Study Mode) ---
+
+        async function getExplanation() {
+            if (!currentTopic) return;
+            currentView = 'explanation';
+            backText.textContent = `Back to Topics in ${currentCourse.name}`;
+            
+            showLoading(`Generating Summary for ${currentTopic.name}`, 'Fetching detailed notes and generating a custom diagram...');
+            
+            const textPromise = (async () => {
+                const payload = {
+                    contents: [{ parts: [{ text: currentTopic.explPrompt }] }],
+                    systemInstruction: { parts: [{ text: "You are an expert academic writer providing a detailed, well-structured, easy-to-read summary for a physical therapy university student. Use markdown formatting extensively (bolding, lists, headings) to make the text digestible." }] },
+                };
+                const options = { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) };
+                const result = await fetchWithBackoff(TEXT_API_URL, options);
+                return result?.candidates?.[0]?.content?.parts?.[0]?.text || "Failed to generate text explanation.";
+            })();
+
+            const imagePromise = (async () => {
+                const payload = { 
+                    instances: { prompt: currentTopic.imgPrompt }, 
+                    parameters: { "sampleCount": 1 } 
+                };
+                const options = { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) };
+                const result = await fetchWithBackoff(IMAGE_API_URL, options);
+                
+                const base64Data = result?.predictions?.[0]?.bytesBase64Encoded;
+                if (base64Data) {
+                    return `data:image/png;base64,${base64Data}`;
+                }
+                return null;
+            })();
+
+            try {
+                const [explanationText, imageUrl] = await Promise.all([textPromise, imagePromise]);
+                renderExplanation(explanationText, imageUrl);
+            } catch (error) {
+                console.error("Explanation/Image Generation Error:", error);
+                showMessage('alert-triangle', 'Content Generation Failed', `Could not fetch the detailed summary or diagram. Error: ${error.message}`);
+            }
+        }
+        
+        function renderExplanation(text, imageUrl) {
+            actionBar.classList.remove('hidden');
+            
+            let imageSection = '';
+            if (imageUrl) {
+                imageSection = `
+                    <div class="bg-gray-100 p-4 rounded-xl mb-6 shadow-inner text-center">
+                        <h3 class="text-xl font-semibold text-gray-700 mb-4">Diagram for ${currentTopic.name}</h3>
+                        <img src="${imageUrl}" alt="Diagram for ${currentTopic.name}" class="rounded-lg max-w-full mx-auto shadow-lg border border-gray-300" style="max-height: 400px; object-fit: contain;">
+                        <p class="text-sm text-gray-500 mt-2">Generated by Imagen.</p>
+                    </div>
+                `;
+            } else {
+                imageSection = `
+                    <div class="bg-yellow-50 p-3 rounded-lg mb-6 text-yellow-700 flex items-center space-x-2">
+                        <i data-lucide="image-off" class="w-5 h-5"></i>
+                        <p>Could not generate a diagram for this topic, but the detailed summary is below!</p>
+                    </div>
+                `;
+            }
+
+            contentArea.innerHTML = `
+                <h2 class="text-2xl font-bold text-gray-800 mb-6 border-b pb-2">${currentTopic.name} Summary</h2>
+                ${imageSection}
+                <div class="prose max-w-none">
+                    ${formatMarkdown(text)}
+                </div>
+            `;
+            lucide.createIcons();
+        }
+
+        // --- QUIZ GAME LOGIC (30 Qs, 15 Min, Immediate Feedback) ---
+
+        async function startQuiz() {
+            if (!currentTopic) return;
+            currentView = 'quiz';
+            backText.textContent = `Back to Topics in ${currentCourse.name}`;
+            
+            showLoading(`Generating ${QUIZ_LENGTH}-Question Quiz for ${currentTopic.name}`, 'The Gemini model is creating 30 fresh, challenging questions for you...');
+            actionBar.classList.remove('hidden');
+            quizStatus.classList.add('hidden'); // Hide status bar during generation
+
+            // Reset state
+            currentQuestionIndex = 0;
+            score = 0;
+            quizData = [];
+            
+            const quizPrompt = `Generate a ${QUIZ_LENGTH}-question multiple-choice quiz on ${currentTopic.name}. The questions must be highly specific and challenging, suitable for a university-level physical therapy exam.`;
+            const systemInstruction = "You are an expert physiotherapy tutor. Generate a university-level multiple-choice quiz based on the user's topic request. The response MUST strictly adhere to the provided JSON schema. Ensure the options are plausible distractors and the 'correctAnswer' field exactly matches the text of the correct option in the 'options' array.";
+
+            const quizSchema = {
+                type: "ARRAY",
+                items: {
+                    type: "OBJECT",
+                    properties: {
+                        "question": { "type": "STRING" },
+                        "options": {
+                            "type": "ARRAY",
+                            "items": { "type": "STRING" }
+                        },
+                        "correctAnswer": { "type": "STRING" }
+                    },
+                    required: ["question", "options", "correctAnswer"]
+                }
+            };
+            
+            const payload = {
+                contents: [{ parts: [{ text: quizPrompt }] }],
+                systemInstruction: { parts: [{ text: systemInstruction }] },
+                generationConfig: {
+                    responseMimeType: "application/json",
+                    responseSchema: quizSchema
+                },
+            };
+
+            const options = {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            };
+
+            try {
+                const result = await fetchWithBackoff(TEXT_API_URL, options);
+                const jsonText = result?.candidates?.[0]?.content?.parts?.[0]?.text;
+                
+                if (!jsonText) throw new Error("API response was missing expected content.");
+
+                let cleanedJsonText = jsonText.trim();
+                if (cleanedJsonText.startsWith('```json')) {
+                    cleanedJsonText = cleanedJsonText.substring(7);
+                    if (cleanedJsonText.endsWith('```')) {
+                        cleanedJsonText = cleanedJsonText.substring(0, cleanedJsonText.length - 3);
+                    }
+                }
+                
+                const parsedData = JSON.parse(cleanedJsonText);
+                
+                if (Array.isArray(parsedData) && parsedData.length === QUIZ_LENGTH) {
+                    quizData = parsedData;
+                    startTimer();
+                    quizStatus.classList.remove('hidden');
+                    renderQuestion();
+                } else {
+                    throw new Error(`Generated quiz data was invalid or did not contain exactly ${QUIZ_LENGTH} questions.`);
+                }
+
+            } catch (error) {
+                console.error("Quiz Generation Error:", error);
+                showMessage(
+                    'alert-triangle', 
+                    'Quiz Failed to Load', 
+                    `We couldn't generate the quiz. Error: ${error.message}. Please try again.`
+                );
+            }
+        }
+
+        function renderQuestion() {
+            if (currentQuestionIndex >= quizData.length) {
+                renderResults();
+                return;
+            }
+            
+            startTimer(); // Resume timer
+
+            const q = quizData[currentQuestionIndex];
+            isAnswered = false;
+            selectedAnswer = null;
+            progressText.textContent = `Q ${currentQuestionIndex + 1}/${QUIZ_LENGTH}`;
+
+            const template = document.getElementById('quiz-template').content.cloneNode(true);
+            template.querySelector('#q-text').textContent = q.question;
+            const optionsContainer = template.querySelector('#q-options');
+            const submitButton = template.querySelector('#q-submit');
+            const feedbackArea = template.querySelector('#q-feedback');
+            feedbackArea.classList.add('hidden'); // Ensure feedback is hidden
+
+            q.options.forEach(optionText => {
+                const optionDiv = document.createElement('div');
+                optionDiv.className = 'option-item p-3 border border-gray-300 rounded-xl cursor-pointer transition duration-150 hover:bg-blue-50 flex items-center justify-between';
+                optionDiv.textContent = optionText;
+                optionDiv.onclick = () => selectOption(optionDiv, optionText, optionsContainer);
+                optionsContainer.appendChild(optionDiv);
+            });
+
+            submitButton.onclick = handleSubmit;
+            submitButton.disabled = true;
+            submitButton.querySelector('#submit-text').textContent = 'Submit Answer';
+            submitButton.querySelector('i').setAttribute('data-lucide', 'check-circle');
+            submitButton.classList.remove('bg-blue-500', 'hover:bg-blue-600');
+            submitButton.classList.add('bg-emerald-500', 'hover:bg-emerald-600');
+
+            contentArea.innerHTML = '';
+            contentArea.appendChild(template);
+            lucide.createIcons();
+        }
+        
+        // --- IMMEDIATE FEEDBACK LOGIC ---
+
+        async function getImmediateExplanation(question, correctAnswer) {
+            const prompt = `Provide a concise, detailed explanation focusing on why the correct answer, "${correctAnswer}", is right for the following question: "${question}". Include relevant scientific context suitable for a university-level physical therapy student. Keep it brief and to the point.`;
+            
+            const payload = {
+                contents: [{ parts: [{ text: prompt }] }],
+                systemInstruction: { parts: [{ text: "You are an academic expert providing a brief, well-formatted explanation using strong, clear language and markdown (bolding, lists) to aid comprehension." }] },
+            };
+            const options = { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) };
+
+            try {
+                const result = await fetchWithBackoff(TEXT_API_URL, options);
+                return result?.candidates?.[0]?.content?.parts?.[0]?.text || "Could not generate a detailed reason.";
+            } catch (error) {
+                console.error("Explanation API Error:", error);
+                return "Failed to fetch detailed explanation due to an API error. Check your connection or try again.";
+            }
+        }
+
+        function selectOption(selectedDiv, answerText, container) {
+            if (isAnswered) return;
+            
+            container.querySelectorAll('.option-item').forEach(div => {
+                div.classList.remove('bg-blue-100', 'border-blue-500');
+            });
+            
+            selectedDiv.classList.add('bg-blue-100', 'border-blue-500');
+            selectedAnswer = answerText;
+
+            const submitButton = document.getElementById('q-submit');
+            submitButton.disabled = false;
+        }
+
+        async function handleSubmit() {
+            if (!selectedAnswer || isAnswered) return;
+
+            isAnswered = true;
+            stopTimer(); // Stop timer for review
+            const q = quizData[currentQuestionIndex];
+            const isCorrect = selectedAnswer === q.correctAnswer;
+            
+            if (isCorrect) {
+                score++;
+            }
+
+            const optionsContainer = contentArea.querySelector('#q-options');
+            const feedbackArea = contentArea.querySelector('#q-feedback');
+            const explanationContent = contentArea.querySelector('#explanation-content');
+            const submitButton = document.getElementById('q-submit');
+            
+            // 1. Mark options visually
+            optionsContainer.querySelectorAll('.option-item').forEach(div => {
+                const optionText = div.textContent;
+                div.classList.remove('cursor-pointer', 'hover:bg-blue-50', 'bg-blue-100', 'border-blue-500');
+                
+                div.innerHTML = optionText; 
+                
+                if (optionText === q.correctAnswer) {
+                    div.classList.add('bg-emerald-100', 'border-emerald-600', 'font-bold');
+                    div.innerHTML += '<i data-lucide="check-circle" class="w-5 h-5 text-emerald-600 ml-2"></i>';
+                } else if (optionText === selectedAnswer && !isCorrect) {
+                    div.classList.add('bg-red-100', 'border-red-600', 'line-through');
+                    div.innerHTML += '<i data-lucide="x-circle" class="w-5 h-5 text-red-600 ml-2"></i>';
+                } else {
+                    div.classList.add('bg-gray-100', 'text-gray-500');
+                }
+            });
+            lucide.createIcons();
+
+
+            // 2. Show loading for explanation
+            feedbackArea.classList.remove('hidden');
+            explanationContent.innerHTML = `
+                <div class="flex items-center space-x-3 text-gray-500">
+                    <div class="loading-ring w-6 h-6 border-2 mx-0"></div>
+                    <span>Generating detailed reason...</span>
+                </div>
+            `;
+            
+            // 3. Fetch and display explanation
+            const explanationText = await getImmediateExplanation(q.question, q.correctAnswer);
+            explanationContent.innerHTML = formatMarkdown(explanationText);
+
+            // 4. Update button to Next
+            submitButton.onclick = nextQuestion;
+            submitButton.classList.remove('bg-emerald-500', 'hover:bg-emerald-600');
+            submitButton.classList.add('bg-blue-500', 'hover:bg-blue-600');
+            submitButton.querySelector('#submit-text').textContent = currentQuestionIndex === QUIZ_LENGTH - 1 ? 'View Final Results' : 'Next Question';
+            submitButton.querySelector('i').setAttribute('data-lucide', 'arrow-right');
+            lucide.createIcons();
+        }
+
+        function nextQuestion() {
+            currentQuestionIndex++;
+            renderQuestion();
+        }
+
+        function renderResults(timeExpired = false) {
+            stopTimer(); // Ensure timer is stopped
+            currentView = 'results';
+            
+            const template = document.getElementById('results-template').content.cloneNode(true);
+            const total = quizData.length;
+            const percentage = Math.round((score / total) * 100);
+
+            template.querySelector('#final-score').textContent = score;
+            template.querySelector('#total-questions').textContent = total;
+            
+            const feedbackDiv = template.querySelector('#feedback-message');
+
+            if (timeExpired) {
+                feedbackDiv.textContent = `Time Expired! You completed ${currentQuestionIndex} questions, scoring ${score} correct answers.`;
+                feedbackDiv.classList.add('bg-red-100', 'text-red-700');
+                template.querySelector('h2').textContent = "Time's Up!";
+                template.querySelector('i').setAttribute('data-lucide', 'alert-triangle');
+            }
+            else if (percentage >= 80) {
+                feedbackDiv.textContent = `Outstanding performance! You achieved ${percentage}% and have mastered this topic.`;
+                feedbackDiv.classList.add('bg-emerald-100', 'text-emerald-700');
+            } else if (percentage >= 50) {
+                feedbackDiv.textContent = `Solid understanding with ${percentage}%. Review the summary and try again to close the gaps.`;
+                feedbackDiv.classList.add('bg-yellow-100', 'text-yellow-700');
+            } else {
+                feedbackDiv.textContent = `Time to hit the books! You scored ${percentage}%. We recommend starting with the topic summary before retaking the quiz.`;
+                feedbackDiv.classList.add('bg-red-100', 'text-red-700');
+            }
+
+            template.querySelector('#review-button').onclick = getExplanation; 
+
+            contentArea.innerHTML = '';
+            contentArea.appendChild(template);
+            lucide.createIcons();
+        }
+
+        // --- INITIALIZATION ---
+        window.onload = function() {
+            renderTopicSelection();
+        };
+
+    </script>
+</body>
+</html>

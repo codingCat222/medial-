@@ -1,0 +1,564 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PhysioStudy Hub: Learn & Quiz</title>
+    <!-- Load Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Load Lucide Icons -->
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <style>
+        /* Custom font import */
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@100..900&display=swap');
+        
+        :root {
+            --primary: #059669; /* Emerald 600 */
+            --secondary: #2563eb; /* Blue 600 */
+            --bg-light: #f9fafb;
+        }
+
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: var(--bg-light);
+        }
+
+        .card {
+            box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05);
+        }
+        
+        .loading-ring {
+            display: inline-block;
+            width: 50px;
+            height: 50px;
+            border: 5px solid #d1d5db; /* Gray 300 */
+            border-radius: 50%;
+            border-top-color: var(--primary);
+            animation: spin 1s ease-in-out infinite;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+        
+        /* Ensures the icon rendering works within the shadow DOM if used */
+        [data-lucide] {
+            display: inline-block;
+        }
+    </style>
+</head>
+<body class="min-h-screen flex items-start pt-12 justify-center p-4">
+
+    <div id="app" class="w-full max-w-3xl bg-white rounded-xl card p-6 md:p-10 mb-12">
+        
+        <!-- Header -->
+        <header class="mb-8 text-center border-b pb-4 border-gray-100">
+            <div class="flex items-center justify-center space-x-3 text-gray-700 mb-2">
+                <i data-lucide="stethoscope" class="w-8 h-8 text-green-600"></i>
+                <h1 class="text-3xl font-extrabold text-gray-800">PhysioStudy Hub</h1>
+            </div>
+            <p class="text-gray-500 text-base">Your integrated learning platform for medical sciences.</p>
+        </header>
+
+        <!-- Dynamic Content Area -->
+        <div id="content-area">
+            <!-- Content will be rendered here by JavaScript -->
+        </div>
+        
+        <!-- Action bar for returning to selection (visible in quiz/explanation mode) -->
+        <div id="action-bar" class="mt-8 pt-4 border-t border-gray-100 hidden">
+            <button id="back-to-topics" class="py-2 px-4 bg-gray-100 hover:bg-gray-200 text-gray-700 font-medium rounded-lg transition duration-200 flex items-center space-x-2">
+                <i data-lucide="arrow-left" class="w-4 h-4"></i>
+                <span>Back to Topics</span>
+            </button>
+        </div>
+
+    </div>
+    
+    <!-- Template for a single quiz question -->
+    <template id="quiz-template">
+        <div class="space-y-6">
+            <div class="bg-gray-100 p-4 rounded-xl shadow-inner border-l-4 border-emerald-500">
+                <p class="text-sm font-semibold text-gray-500 mb-1" id="q-index"></p>
+                <p class="text-lg font-medium text-gray-700" id="q-text"></p>
+            </div>
+            
+            <div id="q-options" class="space-y-3">
+                <!-- Options will be injected here -->
+            </div>
+
+            <div class="pt-4">
+                <button id="q-submit" class="w-full py-3 px-6 bg-emerald-500 hover:bg-emerald-600 text-white font-bold rounded-xl transition duration-200 disabled:opacity-50 flex items-center justify-center space-x-2 shadow-md">
+                    <span id="submit-text">Submit Answer</span>
+                    <i data-lucide="check-circle" class="w-5 h-5"></i>
+                </button>
+            </div>
+        </div>
+    </template>
+    
+    <!-- Template for displaying results -->
+    <template id="results-template">
+        <div class="text-center space-y-6">
+            <i data-lucide="trophy" class="w-16 h-16 mx-auto text-yellow-500"></i>
+            <h2 class="text-3xl font-bold text-gray-800">Quiz Complete!</h2>
+            <p class="text-xl text-gray-600">You scored <span id="final-score" class="font-extrabold text-emerald-600"></span> out of <span id="total-questions" class="font-bold"></span>.</p>
+            
+            <div id="feedback-message" class="text-lg font-medium p-4 rounded-xl"></div>
+
+            <button id="review-button" class="mt-4 w-full py-3 px-6 bg-blue-500 hover:bg-blue-600 text-white font-bold rounded-xl transition duration-200 flex items-center justify-center space-x-2 shadow-md">
+                <i data-lucide="rotate-ccw" class="w-5 h-5"></i>
+                <span>Review Topic Summary</span>
+            </button>
+        </div>
+    </template>
+
+    <script>
+        // --- GLOBAL CONFIGURATION AND SETUP ---
+        const API_KEY = ""; // Canvas environment provides the key at runtime
+        const TEXT_MODEL = "gemini-2.5-flash-preview-09-2025";
+        const IMAGE_MODEL = "imagen-4.0-generate-001";
+        const TEXT_API_URL = `https://generativelanguage.googleapis.com/v1beta/models/${TEXT_MODEL}:generateContent?key=${API_KEY}`;
+        const IMAGE_API_URL = `https://generativelanguage.googleapis.com/v1beta/models/${IMAGE_MODEL}:predict?key=${API_KEY}`;
+        
+        // Topics for the student to select
+        const TOPICS = [
+            { 
+                name: "Anatomy & Kinesiology", 
+                quizPrompt: "Generate a 10-question multiple-choice quiz on advanced human gross anatomy, joint biomechanics, and muscle origin/insertion points. University level.",
+                explPrompt: "Provide a detailed, structured summary of the core principles of Human Anatomy and Kinesiology for a physical therapy student, including key concepts like joint classification, muscle physiology, and gait analysis. The explanation should be suitable for a university-level student.",
+                imgPrompt: "Detailed medical illustration of the human knee joint focusing on ligaments, menisci, and associated musculature, professional style."
+            },
+            { 
+                name: "Physiology & Pathophysiology", 
+                quizPrompt: "Generate a 10-question multiple-choice quiz on cardiac and pulmonary physiology, nervous system control, and common conditions like COPD and stroke. University level.",
+                explPrompt: "Provide a detailed, structured summary of the core principles of Human Physiology and common Pathophysiology relevant to rehabilitation, covering cardiovascular, respiratory, and neurological systems. Suitable for a university-level student.",
+                imgPrompt: "Scientific diagram illustrating the motor pathways in the central nervous system, showing the corticospinal tract and associated lesions, highly detailed."
+            },
+            { 
+                name: "Pharmacology & Therapeutics", 
+                quizPrompt: "Generate a 10-question multiple-choice quiz on NSAIDs, muscle relaxants, corticosteroids, and common analgesic mechanisms of action and side effects. University level.",
+                explPrompt: "Provide a detailed, structured summary of the core principles of Pharmacology and Therapeutics relevant to physical therapy, focusing on mechanisms, side effects, and clinical indications of key drug classes. Suitable for a university-level student.",
+                imgPrompt: "Infographic diagram showing the inflammatory cascade and the site of action for common non-steroidal anti-inflammatory drugs (NSAIDs) and their effect on COX enzymes, stylized."
+            },
+        ];
+        
+        // Quiz State
+        let currentTopic = null; // Stores the entire topic object
+        let quizData = [];
+        let currentQuestionIndex = 0;
+        let score = 0;
+        let selectedAnswer = null;
+        let isAnswered = false;
+
+        const contentArea = document.getElementById('content-area');
+        const actionBar = document.getElementById('action-bar');
+        document.getElementById('back-to-topics').addEventListener('click', renderTopicSelection);
+
+        // --- UTILITY FUNCTIONS & AUTH SETUP ---
+
+        /**
+         * Generic function to display messages/loaders in the content area.
+         */
+        function showLoading(title, message) {
+            actionBar.classList.add('hidden');
+            contentArea.innerHTML = `
+                <div class="text-center p-8 space-y-4">
+                    <div class="loading-ring mx-auto"></div>
+                    <h2 class="text-2xl font-bold text-gray-800">${title}</h2>
+                    <p class="text-gray-600">${message}</p>
+                </div>
+            `;
+        }
+        
+        function showMessage(icon, title, message) {
+            actionBar.classList.add('hidden');
+            contentArea.innerHTML = `
+                <div class="text-center p-6 space-y-4">
+                    <i data-lucide="${icon}" class="w-12 h-12 mx-auto text-red-500"></i>
+                    <h2 class="text-2xl font-bold text-gray-800">${title}</h2>
+                    <p class="text-gray-600">${message}</p>
+                </div>
+            `;
+            lucide.createIcons();
+            setTimeout(renderTopicSelection, 5000); // Auto-return on error
+        }
+
+        /**
+         * Handles the API call with exponential backoff for resilience.
+         */
+        async function fetchWithBackoff(url, options, maxRetries = 5) {
+            for (let i = 0; i < maxRetries; i++) {
+                try {
+                    const response = await fetch(url, options);
+                    if (response.ok) {
+                        return await response.json();
+                    }
+                    if (response.status === 429 && i < maxRetries - 1) { // Too Many Requests
+                        const delay = Math.pow(2, i) * 1000 + Math.random() * 1000;
+                        await new Promise(resolve => setTimeout(resolve, delay));
+                        continue;
+                    }
+                    throw new Error(`API request failed with status: ${response.status} ${response.statusText}`);
+                } catch (error) {
+                    if (i === maxRetries - 1) {
+                        throw new Error(`Failed to fetch content after ${maxRetries} attempts: ${error.message}`);
+                    }
+                    const delay = Math.pow(2, i) * 1000 + Math.random() * 1000;
+                    await new Promise(resolve => setTimeout(resolve, delay));
+                }
+            }
+        }
+
+        // --- TOPIC SELECTION ---
+
+        function renderTopicSelection() {
+            actionBar.classList.add('hidden');
+            contentArea.innerHTML = `
+                <h2 class="text-xl font-semibold text-gray-800 mb-6 text-center">Select a Topic to Study or Quiz</h2>
+                <div class="space-y-6" id="topic-list">
+                    <!-- Topics will be injected here -->
+                </div>
+            `;
+            
+            const topicList = document.getElementById('topic-list');
+            TOPICS.forEach(topic => {
+                const topicCard = document.createElement('div');
+                topicCard.className = 'p-5 border border-gray-200 rounded-xl shadow-md space-y-3';
+                topicCard.innerHTML = `
+                    <h3 class="text-xl font-bold text-gray-700">${topic.name}</h3>
+                    <p class="text-sm text-gray-500">${topic.explPrompt.split('The explanation')[0].trim()}</p>
+                    <div class="flex flex-col sm:flex-row space-y-2 sm:space-y-0 sm:space-x-4 pt-3 border-t mt-3 border-gray-100">
+                        <button data-topic-name="${topic.name}" data-mode="explanation" class="topic-action w-full py-2 px-4 bg-blue-500 hover:bg-blue-600 text-white font-medium rounded-lg transition duration-150 flex items-center justify-center space-x-2 shadow-sm">
+                            <i data-lucide="book-open" class="w-5 h-5"></i>
+                            <span>Read Summary & Diagram</span>
+                        </button>
+                        <button data-topic-name="${topic.name}" data-mode="quiz" class="topic-action w-full py-2 px-4 bg-emerald-500 hover:bg-emerald-600 text-white font-medium rounded-lg transition duration-150 flex items-center justify-center space-x-2 shadow-sm">
+                            <i data-lucide="brain-circuit" class="w-5 h-5"></i>
+                            <span>Start Quiz</span>
+                        </button>
+                    </div>
+                `;
+                topicList.appendChild(topicCard);
+            });
+            lucide.createIcons();
+            
+            document.querySelectorAll('.topic-action').forEach(button => {
+                button.addEventListener('click', (e) => {
+                    const topicName = e.currentTarget.dataset.topicName;
+                    const mode = e.currentTarget.dataset.mode;
+                    currentTopic = TOPICS.find(t => t.name === topicName);
+                    
+                    if (mode === 'explanation') {
+                        getExplanation();
+                    } else if (mode === 'quiz') {
+                        startQuiz();
+                    }
+                });
+            });
+        }
+
+        // --- EXPLANATION & IMAGE GENERATION LOGIC ---
+
+        async function getExplanation() {
+            if (!currentTopic) return;
+            
+            showLoading(`Generating ${currentTopic.name} Explanation`, 'Please wait while we fetch the detailed summary and generate a custom diagram for your study session...');
+            
+            // 1. Fetch Text Explanation (Non-grounded)
+            const textPromise = (async () => {
+                const payload = {
+                    contents: [{ parts: [{ text: currentTopic.explPrompt }] }],
+                    systemInstruction: { parts: [{ text: "You are an expert academic writer providing a detailed, well-structured, easy-to-read summary for a physical therapy university student. Use markdown formatting extensively (bolding, lists, headings) to make the text digestible." }] },
+                };
+                const options = { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) };
+                const result = await fetchWithBackoff(TEXT_API_URL, options);
+                return result?.candidates?.[0]?.content?.parts?.[0]?.text || "Failed to generate text explanation.";
+            })();
+
+            // 2. Fetch Image Diagram (Imagen)
+            const imagePromise = (async () => {
+                const payload = { 
+                    instances: { prompt: currentTopic.imgPrompt }, 
+                    parameters: { "sampleCount": 1 } 
+                };
+                const options = { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) };
+                const result = await fetchWithBackoff(IMAGE_API_URL, options);
+                
+                const base64Data = result?.predictions?.[0]?.bytesBase64Encoded;
+                if (base64Data) {
+                    return `data:image/png;base64,${base64Data}`;
+                }
+                return null;
+            })();
+
+            try {
+                const [explanationText, imageUrl] = await Promise.all([textPromise, imagePromise]);
+                renderExplanation(explanationText, imageUrl);
+            } catch (error) {
+                console.error("Explanation/Image Generation Error:", error);
+                showMessage('alert-triangle', 'Content Generation Failed', `Could not fetch the detailed summary or diagram. Error: ${error.message}`);
+            }
+        }
+        
+        function renderExplanation(text, imageUrl) {
+            actionBar.classList.remove('hidden');
+            
+            let imageSection = '';
+            if (imageUrl) {
+                imageSection = `
+                    <div class="bg-gray-100 p-4 rounded-xl mb-6 shadow-inner text-center">
+                        <h3 class="text-xl font-semibold text-gray-700 mb-4">Diagram for ${currentTopic.name}</h3>
+                        <img src="${imageUrl}" alt="Diagram for ${currentTopic.name}" class="rounded-lg max-w-full mx-auto shadow-lg border border-gray-300" style="max-height: 400px; object-fit: contain;">
+                        <p class="text-sm text-gray-500 mt-2">Generated by Imagen.</p>
+                    </div>
+                `;
+            } else {
+                imageSection = `
+                    <div class="bg-yellow-50 p-3 rounded-lg mb-6 text-yellow-700 flex items-center space-x-2">
+                        <i data-lucide="image-off" class="w-5 h-5"></i>
+                        <p>Could not generate a diagram for this topic, but the detailed summary is below!</p>
+                    </div>
+                `;
+            }
+
+            contentArea.innerHTML = `
+                <h2 class="text-2xl font-bold text-gray-800 mb-6 border-b pb-2">Course Summary: ${currentTopic.name}</h2>
+                ${imageSection}
+                <div class="prose max-w-none">
+                    ${formatMarkdown(text)}
+                </div>
+            `;
+            lucide.createIcons();
+        }
+        
+        /**
+         * Simple markdown formatting for display
+         */
+        function formatMarkdown(markdown) {
+            let html = markdown;
+            // Headings
+            html = html.replace(/^### (.*$)/gim, '<h3>$1</h3>');
+            html = html.replace(/^## (.*$)/gim, '<h2>$1</h2>');
+            html = html.replace(/^# (.*$)/gim, '<h1>$1</h1>');
+            // Bold
+            html = html.replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>');
+            html = html.replace(/__(.*?)__/g, '<strong>$1</strong>');
+            // Lists (simple conversion for display)
+            html = html.replace(/^\* (.*$)/gim, '<li>$1</li>');
+            html = html.replace(/^(<li>.*<\/li>)/gims, '<ul>$1</ul>');
+            // Paragraphs (ensure line breaks are respected)
+            html = html.replace(/\n\n/g, '</p><p>');
+            html = `<p>${html}</p>`;
+            return html;
+        }
+
+        // --- QUIZ GAME LOGIC (Modified to use currentTopic) ---
+
+        async function startQuiz() {
+            if (!currentTopic) return;
+            
+            showLoading(`Generating ${currentTopic.name} Quiz`, 'The Gemini model is creating 10 fresh, challenging questions for you...');
+            actionBar.classList.remove('hidden');
+
+            // Reset state
+            currentQuestionIndex = 0;
+            score = 0;
+            quizData = [];
+            
+            const systemInstruction = "You are an expert physiotherapy tutor. Generate a university-level multiple-choice quiz based on the user's topic request. The response MUST strictly adhere to the provided JSON schema. Ensure the options are plausible distractors and the 'correctAnswer' field exactly matches the text of the correct option in the 'options' array.";
+
+            const quizSchema = {
+                type: "ARRAY",
+                items: {
+                    type: "OBJECT",
+                    properties: {
+                        "question": { "type": "STRING" },
+                        "options": {
+                            "type": "ARRAY",
+                            "items": { "type": "STRING" }
+                        },
+                        "correctAnswer": { "type": "STRING" }
+                    },
+                    required: ["question", "options", "correctAnswer"]
+                }
+            };
+            
+            const payload = {
+                contents: [{ parts: [{ text: currentTopic.quizPrompt }] }],
+                systemInstruction: { parts: [{ text: systemInstruction }] },
+                generationConfig: {
+                    responseMimeType: "application/json",
+                    responseSchema: quizSchema
+                },
+            };
+
+            const options = {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            };
+
+            try {
+                const result = await fetchWithBackoff(TEXT_API_URL, options);
+                const jsonText = result?.candidates?.[0]?.content?.parts?.[0]?.text;
+                
+                if (!jsonText) throw new Error("API response was missing expected content.");
+
+                let cleanedJsonText = jsonText.trim();
+                if (cleanedJsonText.startsWith('```json')) {
+                    cleanedJsonText = cleanedJsonText.substring(7);
+                    if (cleanedJsonText.endsWith('```')) {
+                        cleanedJsonText = cleanedJsonText.substring(0, cleanedJsonText.length - 3);
+                    }
+                }
+                
+                const parsedData = JSON.parse(cleanedJsonText);
+                
+                if (Array.isArray(parsedData) && parsedData.length > 0) {
+                    quizData = parsedData;
+                    renderQuestion();
+                } else {
+                    throw new Error("Generated quiz data was empty or invalid.");
+                }
+
+            } catch (error) {
+                console.error("Quiz Generation Error:", error);
+                showMessage(
+                    'alert-triangle', 
+                    'Quiz Failed to Load', 
+                    `We couldn't generate the quiz. Error: ${error.message}. Please try again.`
+                );
+            }
+        }
+
+        function renderQuestion() {
+            if (currentQuestionIndex >= quizData.length) {
+                renderResults();
+                return;
+            }
+
+            const q = quizData[currentQuestionIndex];
+            isAnswered = false;
+            selectedAnswer = null;
+
+            const template = document.getElementById('quiz-template').content.cloneNode(true);
+            template.querySelector('#q-index').textContent = `Question ${currentQuestionIndex + 1} of ${quizData.length} (${currentTopic.name})`;
+            template.querySelector('#q-text').textContent = q.question;
+            const optionsContainer = template.querySelector('#q-options');
+            const submitButton = template.querySelector('#q-submit');
+
+            q.options.forEach(optionText => {
+                const optionDiv = document.createElement('div');
+                optionDiv.className = 'option-item p-3 border border-gray-300 rounded-xl cursor-pointer transition duration-150 hover:bg-blue-50 flex items-center justify-between';
+                optionDiv.textContent = optionText;
+                optionDiv.onclick = () => selectOption(optionDiv, optionText, optionsContainer);
+                optionsContainer.appendChild(optionDiv);
+            });
+
+            submitButton.onclick = handleSubmit;
+
+            contentArea.innerHTML = '';
+            contentArea.appendChild(template);
+            lucide.createIcons();
+
+            submitButton.disabled = true;
+            submitButton.querySelector('#submit-text').textContent = 'Select an Answer';
+        }
+
+        function selectOption(selectedDiv, answerText, container) {
+            if (isAnswered) return;
+            
+            container.querySelectorAll('.option-item').forEach(div => {
+                div.classList.remove('bg-blue-100', 'border-blue-500');
+            });
+            
+            selectedDiv.classList.add('bg-blue-100', 'border-blue-500');
+            selectedAnswer = answerText;
+
+            const submitButton = document.getElementById('q-submit');
+            submitButton.disabled = false;
+            submitButton.querySelector('#submit-text').textContent = 'Submit Answer';
+        }
+
+        function handleSubmit() {
+            if (!selectedAnswer || isAnswered) return;
+
+            isAnswered = true;
+            const q = quizData[currentQuestionIndex];
+            const isCorrect = selectedAnswer === q.correctAnswer;
+            
+            if (isCorrect) {
+                score++;
+            }
+
+            const optionsContainer = contentArea.querySelector('#q-options');
+            optionsContainer.querySelectorAll('.option-item').forEach(div => {
+                const optionText = div.textContent;
+                div.classList.remove('cursor-pointer', 'hover:bg-blue-50', 'bg-blue-100', 'border-blue-500');
+                
+                // Remove existing icon placeholder before adding new one
+                div.innerHTML = optionText; 
+                
+                if (optionText === q.correctAnswer) {
+                    // Mark correct answer
+                    div.classList.add('bg-emerald-100', 'border-emerald-600', 'font-bold');
+                    div.innerHTML += '<i data-lucide="check-circle" class="w-5 h-5 text-emerald-600"></i>';
+                } else if (optionText === selectedAnswer && !isCorrect) {
+                    // Mark incorrect selection
+                    div.classList.add('bg-red-100', 'border-red-600', 'line-through');
+                    div.innerHTML += '<i data-lucide="x-circle" class="w-5 h-5 text-red-600"></i>';
+                } else {
+                    div.classList.add('bg-gray-100', 'text-gray-500');
+                }
+            });
+            
+            const submitButton = document.getElementById('q-submit');
+            submitButton.onclick = nextQuestion;
+            submitButton.classList.remove('bg-emerald-500', 'hover:bg-emerald-600');
+            submitButton.classList.add('bg-blue-500', 'hover:bg-blue-600');
+            submitButton.querySelector('#submit-text').textContent = 'Next Question';
+            submitButton.querySelector('i').setAttribute('data-lucide', 'arrow-right');
+            lucide.createIcons();
+        }
+
+        function nextQuestion() {
+            currentQuestionIndex++;
+            renderQuestion();
+        }
+
+        function renderResults() {
+            const template = document.getElementById('results-template').content.cloneNode(true);
+            const total = quizData.length;
+            const percentage = (score / total) * 100;
+
+            template.querySelector('#final-score').textContent = score;
+            template.querySelector('#total-questions').textContent = total;
+            
+            const feedbackDiv = template.querySelector('#feedback-message');
+
+            if (percentage >= 80) {
+                feedbackDiv.textContent = "Outstanding performance! You've mastered this topic.";
+                feedbackDiv.classList.add('bg-emerald-100', 'text-emerald-700');
+            } else if (percentage >= 50) {
+                feedbackDiv.textContent = "Solid understanding! Review the summary and try again to close the gaps.";
+                feedbackDiv.classList.add('bg-yellow-100', 'text-yellow-700');
+            } else {
+                feedbackDiv.textContent = "Time to hit the books! We recommend starting with the topic summary before retaking the quiz.";
+                feedbackDiv.classList.add('bg-red-100', 'text-red-700');
+            }
+
+            template.querySelector('#review-button').onclick = getExplanation; // Jumps to the explanation mode
+
+            contentArea.innerHTML = '';
+            contentArea.appendChild(template);
+            lucide.createIcons();
+        }
+
+        // --- INITIALIZATION ---
+        window.onload = function() {
+            renderTopicSelection();
+        };
+
+    </script>
+</body>
+</html>
